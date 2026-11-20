@@ -9,6 +9,9 @@ from datetime import datetime
 from typing import Any
 
 
+DEFAULT_LAG_THRESHOLD_SEC = 60.0  # 通道未配置阈值时的默认告警阈值（保持既有语义）
+
+
 @dataclass
 class ChangeEventRecord:
     """变更事件统一结构。"""
@@ -98,6 +101,12 @@ class PipelineBus:
         self.audit_log: list[dict[str, Any]] = []
         # 延迟指标缓冲
         self.lag_buffer: list[dict[str, Any]] = []
+        # 延迟阈值版本注册表 — lag_monitor 维护，按通道记录生效中的阈值版本
+        self.threshold_registry: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # 延迟触发记录 — lag_monitor 产出，audit_trail 异常汇总消费；
+        # 以 (通道, 采样位置) 为键去重，同一采样位置只登记一次
+        self.lag_triggers: list[dict[str, Any]] = []
+        self._lag_trigger_index: dict[tuple[str, str], dict[str, Any]] = {}
         # 解析统计
         self.parse_stats: dict[str, Any] = {
             "total_parsed": 0,
@@ -313,6 +322,61 @@ class PipelineBus:
             self.lag_buffer = self.lag_buffer[-1000:]
         return metric
 
+    def set_threshold_version(self, channel: str, threshold_sec: float,
+                              effective_at: str | None = None) -> dict[str, Any]:
+        """登记通道延迟阈值的新版本。版本号按登记顺序递增。"""
+        if effective_at:
+            try:
+                effective_at = datetime.fromisoformat(str(effective_at).strip()).isoformat()
+            except ValueError:
+                effective_at = None
+        versions = self.threshold_registry[channel]
+        version = {
+            "channel": channel,
+            "version": len(versions) + 1,
+            "threshold_sec": float(threshold_sec),
+            "effective_at": effective_at or datetime.now().isoformat(),
+        }
+        versions.append(version)
+        return dict(version)
+
+    def threshold_at(self, channel: str, at: str | None = None) -> dict[str, Any]:
+        """解析通道在指定时刻实际生效的阈值版本；无配置时回退默认阈值。"""
+        at_iso = at or datetime.now().isoformat()
+        versions = self.threshold_registry.get(channel) or []
+        eligible = [v for v in versions if v["effective_at"] <= at_iso]
+        if eligible:
+            chosen = max(eligible, key=lambda v: (v["effective_at"], v["version"]))
+        elif versions:
+            chosen = min(versions, key=lambda v: (v["effective_at"], v["version"]))
+        else:
+            chosen = {
+                "channel": channel,
+                "version": 0,
+                "threshold_sec": DEFAULT_LAG_THRESHOLD_SEC,
+                "effective_at": "",
+            }
+        return dict(chosen)
+
+    def record_lag_trigger(self, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """登记延迟触发记录。同一通道同一采样位置只登记一次。
+
+        返回 (记录, 是否新登记)；重复提交返回首次登记的原记录，不放大计数。
+        """
+        key = (str(record.get("channel", "")), str(record.get("sample_pos", "")))
+        existing = self._lag_trigger_index.get(key)
+        if existing is not None:
+            return existing, False
+        stored = dict(record)
+        stored["trigger_id"] = len(self.lag_triggers) + 1
+        self.lag_triggers.append(stored)
+        self._lag_trigger_index[key] = stored
+        return stored, True
+
+    def find_lag_trigger(self, channel: str, sample_pos: str) -> dict[str, Any] | None:
+        """按通道与采样位置查询已登记的延迟触发记录。"""
+        return self._lag_trigger_index.get((str(channel), str(sample_pos)))
+
     def snapshot(self) -> dict[str, Any]:
         """全管道状态快照。"""
         return {
@@ -328,6 +392,8 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "lag_trigger_count": len(self.lag_triggers),
+            "threshold_channel_count": len(self.threshold_registry),
         }
 
 

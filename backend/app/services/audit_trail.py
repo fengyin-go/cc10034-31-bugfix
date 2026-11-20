@@ -83,6 +83,69 @@ class AuditTrailService(BaseModuleService):
                 })
         return anomalies
 
+    def lag_anomaly_summary(self) -> dict[str, Any]:
+        """异常汇总：消费延迟触发记录，按实际触发的通道和阈值版本生成值班处置告警记录。
+
+        同一通道同一采样位置只计一次，重复写入不放大异常计数。
+        """
+        alerts: dict[tuple[str, str], dict[str, Any]] = {}
+        duplicates = 0
+        for trigger in pipeline_bus.lag_triggers:
+            if not trigger.get("alerted"):
+                continue
+            key = (str(trigger.get("channel", "")), str(trigger.get("sample_pos", "")))
+            if key in alerts:
+                duplicates += 1
+                continue
+            alerts[key] = {
+                "alert_key": f"{trigger.get('channel')}#{trigger.get('sample_pos')}",
+                "channel": trigger.get("channel"),
+                "sample_pos": trigger.get("sample_pos"),
+                "lag_seconds": trigger.get("lag_seconds"),
+                "threshold_sec": trigger.get("threshold_sec"),
+                "threshold_version": trigger.get("threshold_version"),
+                "status": trigger.get("status"),
+                "sampled_at": trigger.get("sampled_at"),
+                "received_at": trigger.get("received_at"),
+                "sample_threshold_sec": trigger.get("sample_threshold_sec"),
+                "sample_threshold_version": trigger.get("sample_threshold_version"),
+                "receive_threshold_sec": trigger.get("receive_threshold_sec"),
+                "receive_threshold_version": trigger.get("receive_threshold_version"),
+                "threshold_handoff": trigger.get("threshold_handoff"),
+                "handler": "值班处置",
+            }
+        items = list(alerts.values())
+        by_channel: dict[str, int] = {}
+        by_version: dict[str, int] = {}
+        for item in items:
+            channel = str(item["channel"])
+            by_channel[channel] = by_channel.get(channel, 0) + 1
+            version_key = f"{channel}@v{item['threshold_version']}"
+            by_version[version_key] = by_version.get(version_key, 0) + 1
+        return {
+            "alert_total": len(items),
+            "channels": sorted(by_channel),
+            "by_channel": by_channel,
+            "by_threshold_version": by_version,
+            "duplicates_suppressed": duplicates,
+            "alerts": items,
+            "generated_at": datetime.now().isoformat(),
+        }
+
+    def find_lag_alerts(self, channel: str = "", threshold_sec: float | None = None,
+                        threshold_version: int | None = None) -> list[dict[str, Any]]:
+        """回查已发出的延迟告警：按当时采用的阈值或阈值版本筛选。"""
+        result: list[dict[str, Any]] = []
+        for alert in self.lag_anomaly_summary()["alerts"]:
+            if channel and alert["channel"] != channel:
+                continue
+            if threshold_sec is not None and float(alert["threshold_sec"]) != float(threshold_sec):
+                continue
+            if threshold_version is not None and int(alert["threshold_version"]) != int(threshold_version):
+                continue
+            result.append(alert)
+        return result
+
     def compliance_check(self) -> dict[str, Any]:
         """合规性检查。"""
         logs = pipeline_bus.audit_log
